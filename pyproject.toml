@@ -1,0 +1,47 @@
+[project]
+name = "kdb-manager"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "fastapi>=0.116.1",
+    "fastembed>=0.7.1",
+    "gridone-eureka-client[fastapi]==1.0.3",
+    "gridone-logger>=1.0.1",
+    "gridone-rabbitmq==1.2.2",
+    "gridone-redis==1.0.1",
+    "motor>=3.7.1",
+    "openai>=1.97.0",
+    "pandas>=2.3.1",
+    "pydantic-settings>=2.10.1",
+    "python-json-logger>=3.3.0",
+    "qdrant-client>=1.14.3",
+    "sentence-transformers>=5.0.0",
+    "uvicorn>=0.35.0",
+    "transformers>=4.51.0",
+]
+
+[[tool.uv.index]]
+name = "internal"
+url = "http://nuget.gridone.net:7001/simple"
+default = true
+
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu128" }
+torchvision = { index = "pytorch-cu128" }
+torchaudio = { index = "pytorch-cu128" }
+
+[[tool.uv.index]]
+name = "pytorch-cu128"
+url = "https://download.pytorch.org/whl/cu128"
+explicit = true
