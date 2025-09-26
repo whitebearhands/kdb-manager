@@ -8,7 +8,8 @@ import math
 import os
 import random
 import time
-import uuid
+import gc
+import torch
 import asyncio
 from fastapi import Body, Depends, FastAPI, Query
 from fastapi.responses import JSONResponse
@@ -24,6 +25,7 @@ import torch.nn.functional as F
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 from modules.dependencies import (
     get_embedding_model,
+    get_model_device,
     get_qdrant_client,
     get_chunk_id,
     get_sparse_model,
@@ -41,6 +43,7 @@ from logging import getLogger
 from gridone_redis import Redis
 from gridone_rabbitmq.rag import RagProducer, RagEmbeddingWorker
 from routes.feedback import router as FeedBackRouter
+from routes.query_cache import router as QueryRouter
 
 setup_logger(settings.log)
 
@@ -96,9 +99,8 @@ app.add_middleware(
 )
 
 
-app.include_router(
-    FeedBackRouter,
-)
+app.include_router(FeedBackRouter)
+app.include_router(QueryRouter)
 
 embedding_model = get_embedding_model()
 sparse_embedding_model = get_sparse_model()
@@ -510,6 +512,12 @@ async def verify_upsert_integrity(
     }
 
 
+def free_memory():
+    gc.collect()
+    if get_model_device() == "cuda":
+        torch.cuda.empty_cache()
+
+
 @app.post("/api/v1/mongo/page")
 async def update_pages_to_mongo(pages=Body(...)):
     await pages_to_mongo(pages["pages"])
@@ -520,6 +528,7 @@ async def update_pages_to_mongo(pages=Body(...)):
 async def upsert_documents_v2(
     request: UpsertDocument,
 ):
+    device = get_model_device()
     await create_collection(CreateCollection(collection_name=request.collection_name))
     count = 0
     total_document_length = len(request.documents)
@@ -529,7 +538,7 @@ async def upsert_documents_v2(
             batch_docs = request.documents[i : i + 100]
             sentence_pairs = [doc.context for doc in batch_docs]
             dense_embedding = embedding_model.encode(
-                sentence_pairs, normalize_embeddings=True
+                sentence_pairs, normalize_embeddings=True, device=device, batch_size=10
             )
             sparse_vector = []
             for sentence in sentence_pairs:
@@ -552,11 +561,14 @@ async def upsert_documents_v2(
                         },
                     )
                 )
-            result = await qdrant_client.upsert(
+            await qdrant_client.upsert(
                 collection_name=request.collection_name, points=points
             )
             count += len(points)
-            logger.info(result.model_dump())
+            logger.info(f"upserted {len(points)} items (total={count})")
+
+            del dense_embedding, sparse_vector, points, sentence_pairs, batch_docs
+            free_memory()
         except Exception as e:
             logger.error(str(e))
     return {"result": f"{count} items added."}
@@ -565,59 +577,63 @@ async def upsert_documents_v2(
 @app.post("/api/v1/documents", operation_id="upsert_documents")
 async def upsert_documents(request: UpsertDocument):
     """개선된 문서 업서트 with 무결성 보장"""
-
-    await create_collection(CreateCollection(collection_name=request.collection_name))
-
-    total_document_length = len(request.documents)
-    logger.info(f"Starting upsert of {total_document_length} items")
-
-    # 적응형 배치 업서트 실행
-    result = await adaptive_batch_upsert(
-        collection_name=request.collection_name,
-        documents=request.documents,
-        initial_batch_size=100,  # 기존 크기부터 시작
-        min_batch_size=5,  # 문제 시에만 1개씩
-    )
-
-    # 무결성 검증
-    verification = await verify_upsert_integrity(
-        collection_name=request.collection_name,
-        checkpoint_data=result["checkpoint_data"],
-        sample_rate=0.1,
-    )
-
-    # 실패한 문서 재시도 (옵션)
-    retry_count = 0
-    if result["failed_indices"] and len(result["failed_indices"]) < 50:
-        logger.info(f"Retrying {len(result['failed_indices'])} failed documents")
-        failed_docs = [request.documents[i] for i in result["failed_indices"]]
-        retry_result = await adaptive_batch_upsert(
-            collection_name=request.collection_name,
-            documents=failed_docs,
-            initial_batch_size=30,  # 재시도는 작게 시작
-            min_batch_size=1,
+    try:
+        await create_collection(
+            CreateCollection(collection_name=request.collection_name)
         )
-        retry_count = retry_result["successful_count"]
 
-    final_success_count = result["successful_count"] + retry_count
-    final_failed_count = result["failed_count"] - retry_count
+        total_document_length = len(request.documents)
+        logger.info(f"Starting upsert of {total_document_length} items")
 
-    response = {
-        "result": f"{final_success_count}/{total_document_length} items added successfully",
-        "details": {
-            "total_requested": total_document_length,
-            "successful": final_success_count,
-            "failed": final_failed_count,
-            "integrity_verified": verification["verified"],
-            "integrity_rate": verification.get("integrity_rate", 0),
-        },
-    }
+        # 적응형 배치 업서트 실행
+        result = await adaptive_batch_upsert(
+            collection_name=request.collection_name,
+            documents=request.documents,
+            initial_batch_size=100,  # 기존 크기부터 시작
+            min_batch_size=5,  # 문제 시에만 1개씩
+        )
 
-    if final_failed_count > 0:
-        logger.warning(f"Failed to upsert {final_failed_count} documents")
-        response["warning"] = f"{final_failed_count} documents failed to upsert"
+        # 무결성 검증
+        verification = await verify_upsert_integrity(
+            collection_name=request.collection_name,
+            checkpoint_data=result["checkpoint_data"],
+            sample_rate=0.1,
+        )
 
-    return response
+        # 실패한 문서 재시도 (옵션)
+        retry_count = 0
+        if result["failed_indices"] and len(result["failed_indices"]) < 50:
+            logger.info(f"Retrying {len(result['failed_indices'])} failed documents")
+            failed_docs = [request.documents[i] for i in result["failed_indices"]]
+            retry_result = await adaptive_batch_upsert(
+                collection_name=request.collection_name,
+                documents=failed_docs,
+                initial_batch_size=30,  # 재시도는 작게 시작
+                min_batch_size=1,
+            )
+            retry_count = retry_result["successful_count"]
+
+        final_success_count = result["successful_count"] + retry_count
+        final_failed_count = result["failed_count"] - retry_count
+
+        response = {
+            "result": f"{final_success_count}/{total_document_length} items added successfully",
+            "details": {
+                "total_requested": total_document_length,
+                "successful": final_success_count,
+                "failed": final_failed_count,
+                "integrity_verified": verification["verified"],
+                "integrity_rate": verification.get("integrity_rate", 0),
+            },
+        }
+
+        if final_failed_count > 0:
+            logger.warning(f"Failed to upsert {final_failed_count} documents")
+            response["warning"] = f"{final_failed_count} documents failed to upsert"
+
+        return response
+    finally:
+        free_memory()
 
 
 def create_sparse_vector(text):
@@ -729,6 +745,7 @@ async def get_page(chunks):
                         p_id = page.get("paragraph_id")
                         page["id"] = str(page["_id"])
                         del page["_id"]
+                        page["rerank_score"] = float(chunk["reranked_score"])
                         if "bbox" in page["metadatas"]:
                             page["metadatas"]["bbox"] = chunk["metadatas"]["bbox"]
                         if p_id and p_id not in added_p_ids:
@@ -815,6 +832,48 @@ async def get_paragraph(doc_id, paragraph_id, mongo_client: AsyncIOMotorClient):
     else:
         paragraph = res
     return paragraph
+
+
+async def get_search_result(
+    collection_name, query, metadata_filter_key, match_values, top_k
+) -> models.QueryResponse:
+    dense_query = embedding_model.encode(query, normalize_embeddings=True)
+    sparse_query = list(sparse_embedding_model.embed([query]))[0]
+    query_filter = None
+    prefetch = [
+        models.Prefetch(
+            query=models.SparseVector(
+                indices=sparse_query.indices.tolist(),
+                values=sparse_query.values.tolist(),
+            ),
+            using="sparse",
+            limit=top_k,
+        ),
+        models.Prefetch(query=dense_query, using="dense", limit=top_k),
+    ]
+    if metadata_filter_key and len(match_values) > 0:
+        filter_key = f"metadatas.{metadata_filter_key}"
+        query_filter = models.Filter(
+            must=[
+                models.FieldCondition(
+                    key=filter_key, match=models.MatchAny(any=match_values)
+                )
+            ]
+        )
+    fusion_results = await qdrant_client.query_points(
+        collection_name=collection_name,
+        prefetch=prefetch,
+        query_filter=query_filter,
+        search_params=models.SearchParams(hnsw_ef=128),
+        query=models.FusionQuery(fusion=models.Fusion.RRF),
+        limit=50,
+    )
+
+    del (
+        dense_query,
+        sparse_query,
+    )
+    return fusion_results
 
 
 class SearchDocument(BaseModel):
@@ -939,48 +998,23 @@ async def search_similar_documents_with_reranker(request: SearchDocument):
 )
 async def search_similar_documents_with_reranker_v2(request: SearchDocument):
     start_time = time.time()
+
+    query = request.query
+    if request.query_normalize:
+        query = await query_normalizer(request.query)
+
+    fusion_results = await get_search_result(
+        request.collection_name,
+        query,
+        request.metadata_filter_key,
+        request.match_values,
+        request.top_k,
+    )
+
     try:
-        query = request.query
-        if request.query_normalize:
-            query = await query_normalizer(request.query)
-        dense_query = embedding_model.encode(query, normalize_embeddings=True)
-        sparse_query = list(sparse_embedding_model.embed([query]))[0]
-        query_filter = None
-        prefetch = [
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=sparse_query.indices.tolist(),
-                    values=sparse_query.values.tolist(),
-                ),
-                using="sparse",
-                limit=request.top_k,
-            ),
-            models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-        ]
-        if request.metadata_filter_key and len(request.match_values) > 0:
-            filter_key = f"metadatas.{request.metadata_filter_key}"
-
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key=filter_key, match=models.MatchAny(any=request.match_values)
-                    )
-                ]
-            )
-
-        fusion_results = await qdrant_client.query_points(
-            collection_name=request.collection_name,
-            prefetch=prefetch,
-            query_filter=query_filter,
-            search_params=models.SearchParams(hnsw_ef=128),
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=request.top_k,
-            score_threshold=0.1,
-        )
         reranked = grid_rerank(query, fusion_results.points, 5)
         if request.use_paragraph:
             p = await get_page(reranked)
-            logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
             return JSONResponse(content=p)
         else:
             return JSONResponse(content=reranked)
@@ -990,6 +1024,45 @@ async def search_similar_documents_with_reranker_v2(request: SearchDocument):
         end_time = time.time()
         execution_time = end_time - start_time
         logger.info(f"Search time: {execution_time:.5f} sec")
+        del fusion_results
+        free_memory()
+
+
+@app.post(
+    "/api/v2/document/search_paragraph",
+    operation_id="search_paragraph",
+)
+async def search_paragraph(request: SearchDocument):
+    start_time = time.time()
+
+    query = request.query
+    if request.query_normalize:
+        query = await query_normalizer(request.query)
+
+    fusion_results = await get_search_result(
+        request.collection_name,
+        query,
+        request.metadata_filter_key,
+        request.match_values,
+        request.top_k,
+    )
+
+    try:
+        reranked = grid_rerank(query, fusion_results.points, 10)
+        pages = await get_page(reranked)
+        result = [
+            {"paragraph_id": p["paragraph_id"], "score": p["rerank_score"]}
+            for p in pages
+        ]
+        return JSONResponse(content=result)
+    except Exception as e:
+        return JSONResponse(status_code=500, content=str(e))
+    finally:
+        end_time = time.time()
+        execution_time = end_time - start_time
+        logger.info(f"Search time: {execution_time:.5f} sec")
+        del fusion_results
+        free_memory()
 
 
 @app.post(
@@ -1000,36 +1073,13 @@ async def search_similar_documents_test_with_reranker(request: SearchDocument):
     query = request.query
     if request.query_normalize:
         query = await query_normalizer(request.query)
-    dense_query = embedding_model.encode(query, normalize_embeddings=True)
-    sparse_query = list(sparse_embedding_model.embed([query]))[0]
-    query_filter = None
-    prefetch = [
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_query.indices.tolist(),
-                values=sparse_query.values.tolist(),
-            ),
-            using="sparse",
-            limit=request.top_k,
-        ),
-        models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-    ]
-    if request.metadata_filter_key and len(request.match_values) > 0:
-        filter_key = f"metadatas.{request.metadata_filter_key}"
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key=filter_key, match=models.MatchAny(any=request.match_values)
-                )
-            ]
-        )
-    fusion_results = await qdrant_client.query_points(
-        collection_name=request.collection_name,
-        prefetch=prefetch,
-        query_filter=query_filter,
-        search_params=models.SearchParams(hnsw_ef=128),
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=50,
+
+    fusion_results = await get_search_result(
+        request.collection_name,
+        query,
+        request.metadata_filter_key,
+        request.match_values,
+        request.top_k,
     )
     response = {
         "fusion_result": [

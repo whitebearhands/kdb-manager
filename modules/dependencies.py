@@ -11,8 +11,12 @@ from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 logger = getLogger(__name__)
 
-if torch.backends.mps.is_available():
+if torch.cuda.is_available():
+    settings.model.model_device = "cuda"
+elif torch.backends.mps.is_available():
     settings.model.model_device = "mps"
+else:
+    settings.model.model_device = "cpu"
 
 # Dense embedding model 설정
 dense_model_path = os.path.join(settings.model.dense_path, settings.model.dense_name)
@@ -51,6 +55,15 @@ except:
 
 
 client = AsyncQdrantClient(url=settings.qdrant.url, api_key=settings.qdrant.api_key)
+
+
+def get_model_device() -> str:
+    if torch.cuda.is_available():
+        return "cuda"
+    elif torch.backends.mps.is_available():
+        return "mps"
+    else:
+        return "cpu"
 
 
 def get_embedding_model() -> SentenceTransformer:
