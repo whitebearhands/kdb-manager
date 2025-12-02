@@ -106,6 +106,10 @@ class LogSettings(BaseModel):
     )
 
 
+class Encoder(BaseModel):
+    url: str = Field(default="")
+
+
 class RedisSettings(BaseModel):
     host: str = Field(
         default="127.0.0.1",
@@ -246,6 +250,7 @@ class Settings(BaseSettings):
         default_factory=aiio,
         description="qdrant 설정",
     )
+    encoder: Encoder = Field(default_factory=Encoder)
 
     class Config:
         env_file = ".env"

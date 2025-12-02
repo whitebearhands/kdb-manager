@@ -18,6 +18,8 @@ elif torch.backends.mps.is_available():
 else:
     settings.model.model_device = "cpu"
 
+settings.model.model_device = "cpu"
+
 # Dense embedding model 설정
 dense_model_path = os.path.join(settings.model.dense_path, settings.model.dense_name)
 try:

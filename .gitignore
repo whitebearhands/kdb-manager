@@ -18,5 +18,5 @@ __pycache__/
 .idea/coderag-agent.iml
 .idea/misc.xml
 .DS_Store
-
+*.out
 /models/
