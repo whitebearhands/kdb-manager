@@ -1,5 +1,5 @@
 from typing import Dict, List
-from gridone_redis import Redis
+from wrapper.redis_wrapper import Redis
 from config import settings
 from modules.singleton_meta import SingletonMeta
 

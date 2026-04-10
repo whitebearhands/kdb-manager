@@ -8,10 +8,6 @@ dependencies = [
     "dotenv>=0.9.9",
     "fastapi>=0.116.1",
     "fastembed>=0.7.1",
-    "gridone-eureka-client[fastapi]==1.0.3",
-    "gridone-logger>=1.0.1",
-    "gridone-rabbitmq==1.2.2",
-    "gridone-redis==1.0.1",
     "motor>=3.7.1",
     "openai>=1.97.0",
     "pandas>=2.3.1",
@@ -22,12 +18,10 @@ dependencies = [
     "uvicorn>=0.35.0",
     "transformers>=4.51.0",
     "aiohttp>=3.13.2",
+    "redis[asyncio]>=5.0.0",
+    "aio-pika>=9.0.0",
 ]
 
-[[tool.uv.index]]
-name = "internal"
-url = "http://nuget.gridone.net:7001/simple"
-default = true
 
 [[tool.uv.index]]
 name = "pypi"

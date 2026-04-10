@@ -2,7 +2,7 @@ version: '3.8'
 
 services:
   kdb-manager:
-    image: gridone.net/kdb-manager:2.1.1
+    image: whitebearhands/kdb-manager:2.1.1
     container_name: kdb-manager-container
     #ports:
     #  - 28101:28101

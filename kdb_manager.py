@@ -1,100 +1,111 @@
-# --- START OF FILE kdb_manager.py ---
+"""
+kdb_manager.py
+==============
+RAG Knowledge DB Manager — 애플리케이션 진입점.
+
+이 파일의 역할
+--------------
+- FastAPI 앱 생성 및 미들웨어 설정
+- 앱 라이프사이클 (Redis · RabbitMQ 연결/해제)
+- RabbitMQ EmbeddingConsumer 정의
+  (MQ 메시지를 받아 임베딩 → Qdrant upsert → MongoDB 저장 수행)
+- 라우터 등록
+
+각 기능의 세부 구현은 routes/ 패키지에 분리되어 있다.
+  routes/collection.py  — 컬렉션 CRUD, 문서 조회
+  routes/document.py    — 문서 업서트, 삭제, MongoDB 저장
+  routes/search.py      — 하이브리드 검색, 리랭킹, 단락 복원
+  routes/feedback.py    — 검색 피드백
+  routes/query_cache.py — 쿼리 캐싱
+"""
 
 import argparse
 import contextlib
-import html
 import json
-import math
-import os
-import random
-import time
-import gc
-import torch
-import asyncio
-from fastapi import Body, Depends, FastAPI, Query
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-from gridone_eureka_client import EurekaClient
-from gridone_rabbitmq import ConnectionConfig, MessageContext, RabbitMQClient
-import numpy as np
-from pydantic import BaseModel
-from pymongo import ASCENDING
-import requests
-import torch
-import torch.nn.functional as F
-from transformers import AutoModelForSequenceClassification, AutoTokenizer
-from encoder import (
-    encoding_documents,
-    encoding_documents_fast,
-    encoding_query,
-    get_sentence_embedding_dimension,
-)
-from modules.dependencies import (
-    get_embedding_model,
-    get_model_device,
-    get_qdrant_client,
-    get_chunk_id,
-    get_sparse_model,
-)
-
-from motor.motor_asyncio import AsyncIOMotorClient
-from config import settings
-from typing import Any, Dict, List, Union, Optional, Tuple
-from qdrant_client import AsyncQdrantClient
-from qdrant_client.http import models
-from qdrant_client.http.exceptions import ResponseHandlingException, UnexpectedResponse
-from sentence_transformers import SentenceTransformer
-from gridone_logger import setup_logger
 from logging import getLogger
-from gridone_redis import Redis
-from gridone_rabbitmq.rag import RagProducer, RagEmbeddingWorker
+from typing import Any, Dict
+
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+
+from config import settings
+from wrapper.logger_wrapper import setup_logger
+from wrapper.rabbitmq_wrapper import ConnectionConfig, MessageContext, RabbitMQClient
+from wrapper.rabbitmq_wrapper_for_rag import RagEmbeddingWorker, RagProducer
+from wrapper.redis_wrapper import Redis
+
+# 라우터
+from routes.collection import router as CollectionRouter
+from routes.document import (
+    UpsertDocument,
+    chunk_to_mongo,
+    paragraph_to_mongo,
+    router as DocumentRouter,
+    upsert_documents,
+)
 from routes.feedback import router as FeedBackRouter
 from routes.query_cache import router as QueryRouter
-from routes.voc import router as VocRouter
+from routes.search import router as SearchRouter
 
+# ── 로거 초기화 (가장 먼저 실행) ────────────────────────────────────────────
 setup_logger(settings.log)
-
-parser = argparse.ArgumentParser()
-parser.add_argument(
-    "--port", help="config 파일의 위치. 파일명까지 경로를 지정해야 한다."
-)
-args, unknown = parser.parse_known_args()
-if args.port:
-    settings.app.port = int(args.port)
-
 logger = getLogger(__name__)
 
+# ── CLI 인수: --port로 포트 오버라이드 가능 ──────────────────────────────────
+parser = argparse.ArgumentParser()
+parser.add_argument("--port", type=int, help="서비스 포트 번호 (기본값: settings.app.port)")
+args, _ = parser.parse_known_args()
+if args.port:
+    settings.app.port = args.port
 
-eureka_client = EurekaClient()
-handler_name = "kdb-manager"
+# ── EmbeddingConsumer가 실패 메시지에 포함할 서비스 식별자 ───────────────────
+HANDLER_NAME = "kdb-manager"
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# 앱 라이프사이클
+# ════════════════════════════════════════════════════════════════════════════════
 
 
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
-    config = {
-        "port": settings.app.port,
-        "service_name": settings.app.service_name,
-        "eureka_server": settings.app.eureka_server,
-        "use_ssl": False,
-        "use_management": True,
-        "site_key": "production",
-    }
-    # Eureka 등록 (actuator는 이미 설정됨)
-    await eureka_client.run(app, config)
-    # await setup_redis()
-    # await setup_mq()
+    """
+    FastAPI 앱 시작/종료 시 실행되는 라이프사이클 핸들러.
 
-    yield  # 애플리케이션 실행
+    시작 시
+    -------
+    1. Redis 연결 초기화
+    2. RabbitMQ 연결 및 EmbeddingConsumer 등록
 
-    # Shutdown
-    await eureka_client.shutdown()
-    # await clear_mq()
-    # await clear_redis()
+    종료 시
+    -------
+    1. RabbitMQ 연결 해제
+    2. Redis 연결 해제
+    """
+    logger.info("서비스 시작 중...")
+    await _setup_redis()
+    await _setup_mq()
+    logger.info(f"서비스 시작 완료 (port={settings.app.port})")
+
+    yield  # 앱 실행 구간
+
+    logger.info("서비스 종료 중...")
+    await _clear_mq()
+    await _clear_redis()
+    logger.info("서비스 종료 완료")
 
 
-# FastAPI 앱 인스턴스 생성 시 lifespan 핸들러를 등록합니다.
-app = FastAPI(title="KDB SERVER", lifespan=lifespan)
+# ════════════════════════════════════════════════════════════════════════════════
+# FastAPI 앱 생성
+# ════════════════════════════════════════════════════════════════════════════════
+
+app = FastAPI(
+    title="KDB Manager",
+    description="RAG 파이프라인을 위한 벡터 DB 관리 서비스",
+    version="2.1.1",
+    lifespan=lifespan,
+)
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -103,1688 +114,182 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-
+# ── 라우터 등록 ──────────────────────────────────────────────────────────────
+app.include_router(CollectionRouter)
+app.include_router(DocumentRouter)
+app.include_router(SearchRouter)
 app.include_router(FeedBackRouter)
 app.include_router(QueryRouter)
-app.include_router(VocRouter)
 
-embedding_model = get_embedding_model()
-sparse_embedding_model = get_sparse_model()
-qdrant_client = get_qdrant_client()
-# tokenizer = AutoTokenizer.from_pretrained(
-#     "Qwen/Qwen3-Reranker-4B", trust_remote_code=True
-# )
-# if tokenizer.pad_token is None:
-#     eos = tokenizer.eos_token or tokenizer.unk_token
-#     # 방법 1) pad_token_id를 eos로 매핑(임베딩 리사이즈 X)
-#     tokenizer.pad_token = eos
 
-# model = AutoModelForSequenceClassification.from_pretrained(
-#     "Qwen/Qwen3-Reranker-4B", trust_remote_code=True
-# )
-# model.config.pad_token_id = tokenizer.pad_token_id
-# model.eval()
-
-# device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-# if torch.backends.mps.is_available():
-#     device = "mps"
-# elif torch.cuda.is_available():
-#     device = "cude"
-# else:
-#     device = "cpu"
-
-# model.to(device)
-
-
-async def create_documents_index():
-    try:
-        mongo_client = AsyncIOMotorClient(
-            f"mongodb://{settings.db.host}:{settings.db.port}"
-        )
-        doc_collection = mongo_client["rag-data"]["documents"]
-        await doc_collection.create_index(
-            [
-                ("collection_id", ASCENDING),
-                ("metadatas.doc_id", ASCENDING),
-                ("paragraph_id", ASCENDING),
-            ]
-        )
-    except:
-        pass
-
-
-@app.delete(
-    "/api/v1/collection/{collection_name}",
-    operation_id="delete_collection",
-    description="collection_name : html encoded string",
-)
-async def delete_collection(collection_name: str):
-    decoded_collection_name = html.unescape(collection_name)
-    await qdrant_client.delete_collection(decoded_collection_name)
-    return {"result": "Delete collection successfully."}
-
-
-# ... (이하 모든 기존 엔드포인트 코드는 그대로 유지) ...
-@app.get("/api/v1/collection", operation_id="get_collection")
-async def get_collections():
-    result = await qdrant_client.get_collections()
-    return result.collections
-
-
-class CreateCollection(BaseModel):
-    collection_name: str
-
-
-@app.post("/api/v1/collection", operation_id="create_collection")
-async def create_collection(request: CreateCollection):
-    is_exist = await qdrant_client.collection_exists(
-        collection_name=f"{request.collection_name}"
-    )
-    if not is_exist:
-        demension = (
-            embedding_model.get_sentence_embedding_dimension()
-        )  # await get_sentence_embedding_dimension()
-        await qdrant_client.create_collection(
-            collection_name=request.collection_name,
-            vectors_config={
-                "dense": models.VectorParams(
-                    size=demension,
-                    distance=models.Distance.COSINE,
-                    hnsw_config=models.HnswConfigDiff(
-                        m=64, ef_construct=1000, full_scan_threshold=50000
-                    ),
-                )
-            },
-            sparse_vectors_config={
-                "sparse": models.SparseVectorParams(
-                    index=models.SparseIndexParams(on_disk=False)
-                )
-            },
-            optimizers_config=models.OptimizersConfigDiff(
-                indexing_threshold=50000,
-                memmap_threshold=100000,
-                default_segment_number=10,
-                max_optimization_threads=8,
-            ),
-        )
-
-        await qdrant_client.create_payload_index(
-            collection_name=request.collection_name,
-            field_name="metadatas.class",
-            field_schema=models.PayloadSchemaType.KEYWORD,
-        )
-
-    return {"result": "Create collection successfully."}
-
-
-class PageInfo(BaseModel):
-    total_elements: int
-    total_pages: int
-    page: int
-    first: int
-    last: int
-    empty: bool
-
-
-class DocumentResponse(BaseModel):
-    page: List[Dict]
-    page_info: PageInfo
-
-
-@app.get("/api/v1/{collection_name}/{p_id}/paragraph/content")
-async def get_paragraph_content(collection_name: str, p_id: str):
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-
-    page_collection = mongo_client["rag-data"]["documents"]
-    document = await page_collection.find_one(
-        {"collection_id": collection_name, "paragraph_id": p_id}
-    )
-    del document["_id"]
-    return document
-
-
-@app.get(
-    "/api/v1/documents/{collection_name}",
-    operation_id="get_all_documents",
-    description="collection_name : html encoded string",
-    response_model=DocumentResponse,
-)
-async def get_all_documents(
-    collection_name: str,
-    page: int = Query(1),
-    page_size: int = Query(10),
-):
-    decoded_collection_name = html.unescape(collection_name)
-    total_points = await qdrant_client.count(collection_name=decoded_collection_name)
-    total_pages = max(1, math.ceil(total_points.count / page_size))
-    result = await qdrant_client.query_points(
-        collection_name=decoded_collection_name,
-        limit=page_size,
-        offset=page_size * (page - 1),
-    )
-    return {
-        "page": [result.payload for result in result.points],
-        "page_info": {
-            "total_elements": total_points.count,
-            "total_pages": total_pages,
-            "page": page,
-            "first": page == 1,
-            "last": page == total_pages,
-            "empty": len(result.points) == 0,
-        },
-    }
-
-
-class Document(BaseModel):
-    context: str
-    ids: str
-    page_number: int = -1
-    size: int
-    metadatas: Dict[str, Union[str, int, float, list, dict, None]]
-
-
-class UpsertDocument(BaseModel):
-    collection_name: str
-    documents: List[Document]
-
-
-async def retry_with_backoff(
-    func,
-    max_retries: int = 3,
-    initial_delay: float = 1.0,
-    max_delay: float = 30.0,
-    backoff_factor: float = 2.0,
-):
-    """재시도 로직 with exponential backoff"""
-    delay = initial_delay
-    last_exception = None
-
-    for attempt in range(max_retries):
-        try:
-            return await func()
-        except (ResponseHandlingException, UnexpectedResponse, ConnectionError) as e:
-            last_exception = e
-            if attempt < max_retries - 1:
-                logger.warning(
-                    f"Retry {attempt + 1}/{max_retries} after {delay}s: {str(e)}"
-                )
-                await asyncio.sleep(delay)
-                delay = min(delay * backoff_factor, max_delay)
-            else:
-                logger.error(f"Failed after {max_retries} attempts: {str(e)}")
-                raise
-        except Exception as e:
-            logger.error(f"Unexpected error: {str(e)}")
-            raise
-
-    if last_exception:
-        raise last_exception
-
-
-async def upsert_batch_with_retry(
-    collection_name: str,
-    points: List[models.PointStruct],
-    max_retries: int = 3,
-) -> Tuple[bool, Optional[Any]]:
-    """배치 upsert with retry"""
-
-    async def _upsert():
-        return await qdrant_client.upsert(
-            collection_name=collection_name, points=points, wait=True
-        )
-
-    try:
-        result = await retry_with_backoff(_upsert, max_retries=max_retries)
-        return True, result
-    except Exception as e:
-        logger.error(f"Batch upsert failed: {str(e)}")
-        return False, None
-
-
-async def adaptive_batch_upsert(
-    collection_name: str,
-    documents: List[Document],
-    initial_batch_size: int = 100,  # 기존 크기부터 시작
-    min_batch_size: int = 10,  # 문제 시에만 1개씩
-) -> Dict[str, Any]:
-    """동적 배치 크기 조절로 OOME 방지"""
-    batch_size = initial_batch_size
-    successful_count = 0
-    failed_indices = []
-    checkpoint_data = []
-
-    total_docs = len(documents)
-    i = 0
-
-    while i < total_docs:
-        batch_end = min(i + batch_size, total_docs)
-        batch_docs = documents[i:batch_end]
-
-        try:
-            # 메모리 사전 정리
-            import gc
-
-            gc.collect()
-
-            # 문서 크기 체크 및 제한
-            batch_docs_filtered = []
-            for doc in batch_docs:
-                if len(doc.context) > 10000:  # 10KB 텍스트 제한
-                    logger.warning(
-                        f"Document too large ({len(doc.context)} chars), truncating"
-                    )
-                    doc.context = doc.context[:10000]
-                batch_docs_filtered.append(doc)
-
-            sentence_pairs = [doc.context for doc in batch_docs_filtered]
-
-            # 극도로 메모리 효율적인 임베딩 생성
-            dense_embedding = embedding_model.encode(
-                sentence_pairs,
-                normalize_embeddings=True,
-                batch_size=1,  # 무조건 1개씩 임베딩
-                show_progress_bar=False,
-            )
-
-            # Sparse 벡터 생성
-            sparse_vectors = []
-            for sentence in sentence_pairs:
-                try:
-                    sparse_vectors.append(create_sparse_vector(sentence))
-                except Exception as e:
-                    logger.error(f"Sparse vector creation failed: {e}")
-                    sparse_vectors.append(None)
-
-            # 포인트 생성 (메모리 효율적으로)
-            points = []
-            for index, doc in enumerate(batch_docs_filtered):
-                if sparse_vectors[index] is not None:
-                    point_id = get_chunk_id()
-                    points.append(
-                        models.PointStruct(
-                            id=point_id,
-                            vector={
-                                "dense": dense_embedding[index].tolist(),
-                                "sparse": sparse_vectors[index],
-                            },
-                            payload={
-                                "context": doc.context,
-                                "ids": doc.ids,
-                                "page_number": doc.page_number,
-                                "size": doc.size,
-                                "metadatas": doc.metadatas,
-                            },
-                        )
-                    )
-                    checkpoint_data.append(
-                        {
-                            "doc_index": i + index,
-                            "point_id": point_id,
-                            "doc_id": doc.ids,
-                        }
-                    )
-
-                    # 메모리 절약을 위해 중간에 가비지 컬렉션
-                    if len(points) % 10 == 0:
-                        gc.collect()
-
-            # Upsert with retry
-            success, result = await upsert_batch_with_retry(collection_name, points)
-
-            if success:
-                successful_count += len(points)
-                logger.info(f"Batch {i}-{batch_end} succeeded ({len(points)} items)")
-
-                # 성공 시 배치 크기 유지 (최대 4 한계)
-                if batch_size < 101:  # 최대 4까지만
-                    batch_size = min(batch_size + 1, 100)
-                    logger.debug(f"Increasing batch size to {batch_size}")
-
-                i = batch_end
-            else:
-                # 실패 시 배치 크기 감소
-                if batch_size > min_batch_size:
-                    batch_size = max(batch_size // 2, min_batch_size)
-                    logger.warning(
-                        f"Reducing batch size to {batch_size} due to failure"
-                    )
-                else:
-                    # 최소 배치 크기에서도 실패하면 건너뛰고 기록
-                    failed_indices.extend(range(i, batch_end))
-                    logger.error(
-                        f"Skipping batch {i}-{batch_end} after repeated failures"
-                    )
-                    i = batch_end
-
-        except MemoryError:
-            # OOME 발생 시 즉시 1로 감소
-            logger.error(f"CRITICAL: Memory error at batch size {batch_size}")
-            batch_size = 1
-            logger.warning(f"Emergency: reducing batch size to 1 due to memory error")
-
-            # 강력한 메모리 정리
-            import gc
-
-            gc.collect()
-
-            # 약간의 대기 시간 추가
-            await asyncio.sleep(2)
-
-            if batch_size == min_batch_size:
-                # 1개에서도 메모리 에러면 문서가 너무 큰 것
-                logger.critical(f"Cannot process document at index {i} - too large")
-                failed_indices.extend(range(i, batch_end))
-                i = batch_end
-
-        except Exception as e:
-            logger.error(f"Unexpected error in batch {i}-{batch_end}: {str(e)}")
-            failed_indices.extend(range(i, batch_end))
-            i = batch_end
-
-    return {
-        "successful_count": successful_count,
-        "failed_count": len(failed_indices),
-        "failed_indices": failed_indices,
-        "checkpoint_data": checkpoint_data,
-    }
-
-
-async def verify_upsert_integrity(
-    collection_name: str,
-    checkpoint_data: List[Dict],
-    sample_rate: float = 0.1,
-) -> Dict[str, Any]:
-    """업서트 후 무결성 검증"""
-    if not checkpoint_data:
-        return {"verified": True, "message": "No data to verify"}
-
-    # 샘플링 검증 (전체 검증은 부하가 클 수 있음)
-    sample_size = max(1, int(len(checkpoint_data) * sample_rate))
-    sample_indices = random.sample(range(len(checkpoint_data)), sample_size)
-
-    verified_count = 0
-    missing_ids = []
-
-    for idx in sample_indices:
-        checkpoint = checkpoint_data[idx]
-        point_id = checkpoint["point_id"]
-
-        try:
-            # 포인트 존재 확인
-            result = await qdrant_client.retrieve(
-                collection_name=collection_name,
-                ids=[point_id],
-                with_payload=False,
-                with_vectors=False,
-            )
-            if result:
-                verified_count += 1
-            else:
-                missing_ids.append(point_id)
-        except Exception as e:
-            logger.error(f"Verification failed for point {point_id}: {e}")
-            missing_ids.append(point_id)
-
-    integrity_rate = verified_count / sample_size if sample_size > 0 else 0
-
-    return {
-        "verified": integrity_rate >= 0.95,  # 95% 이상 검증 시 성공
-        "integrity_rate": integrity_rate,
-        "sample_size": sample_size,
-        "missing_count": len(missing_ids),
-        "missing_ids": missing_ids[:10],  # 최대 10개만 반환
-    }
-
-
-@app.post("/api/v1/mongo/page")
-async def update_pages_to_mongo(pages=Body(...)):
-    await pages_to_mongo(pages["pages"])
-    return {"status": "ok"}
-
-
-def free_memory():
-    gc.collect()
-    if get_model_device() == "cuda":
-        torch.cuda.empty_cache()
-
-
-def get_available_cuda_devices() -> list[str]:
-    """
-    사용 가능한 모든 GPU를 ["cuda:0", "cuda:1", ...] 형태의 리스트로 반환합니다.
-    GPU가 없으면 빈 리스트 []를 반환합니다.
-    """
-    if not torch.cuda.is_available():
-        return []
-
-    count = torch.cuda.device_count()
-    return [f"cuda:{i}" for i in range(count)]
-
-
-@app.post("/api/v3/documents", operation_id="upsert_documents_v3")
-async def upsert_documents_v3(
-    request: UpsertDocument,
-):
-    await create_collection(CreateCollection(collection_name=request.collection_name))
-    count = 0
-    total_document_length = len(request.documents)
-    logger.info(f"upsert {total_document_length} items requested")
-
-    for i in range(0, total_document_length, 30):
-        try:
-            batch_docs = request.documents[i : i + 30]
-            sentence_pairs = [doc.context for doc in batch_docs]
-            dense_embedding = await encoding_documents(sentence_pairs)
-            sparse_vector = []
-            for sentence in sentence_pairs:
-                sparse_vector.append(create_sparse_vector(sentence))
-            points = []
-            for index, doc in enumerate(batch_docs):
-                points.append(
-                    models.PointStruct(
-                        id=get_chunk_id(),
-                        vector={
-                            "dense": dense_embedding[index].tolist(),
-                            "sparse": sparse_vector[index],
-                        },
-                        payload={
-                            "context": doc.context,
-                            "ids": doc.ids,
-                            "page_number": doc.page_number,
-                            "size": doc.size,
-                            "metadatas": doc.metadatas,
-                        },
-                    )
-                )
-            await qdrant_client.upsert(
-                collection_name=request.collection_name, points=points
-            )
-            count += len(points)
-            logger.info(f"upserted {len(points)} items (total={count})")
-
-        except Exception as e:
-            logger.error(str(e))
-            raise e
-
-    return {"result": f"{count} items added."}
-
-
-def embed_v1(sentence_pairs, device):
-    dense_embedding = embedding_model.encode(
-        sentence_pairs,
-        normalize_embeddings=True,
-        device=device,
-        batch_size=20,
-    )
-
-    return dense_embedding
-
-
-@app.post("/api/v2/documents", operation_id="upsert_documents_v2")
-async def upsert_documents_v2(
-    request: UpsertDocument,
-):
-    await create_collection(CreateCollection(collection_name=request.collection_name))
-
-    device = get_model_device()
-    # pool = embedding_model.start_multi_process_pool(get_available_cuda_devices())
-    await create_collection(CreateCollection(collection_name=request.collection_name))
-    count = 0
-    total_document_length = len(request.documents)
-    logger.info(f"upsert {total_document_length} items requested")
-
-    for i in range(0, total_document_length, 20):
-        try:
-            batch_docs = request.documents[i : i + 20]
-            sentence_pairs = [doc.context for doc in batch_docs]
-            # dense_embedding = await encoding_documents_fast(sentence_pairs)
-            # dense_embedding = embedding_model.encode(
-            #     sentence_pairs,
-            #     normalize_embeddings=True,
-            #     device=device,
-            #     batch_size=20,
-            #     # pool=pool,
-            # )
-
-            dense_task = asyncio.create_task(encoding_documents_fast(sentence_pairs))
-            sparse_task = asyncio.to_thread(create_sparse_vectors_batch, sentence_pairs)
-            dense_embedding, sparse_vectors = await asyncio.gather(
-                dense_task, sparse_task
-            )
-            # sparse_vector = []
-            # for sentence in sentence_pairs:
-            #     sparse_vector.append(create_sparse_vector(sentence))
-            points = []
-            for index, doc in enumerate(batch_docs):
-                points.append(
-                    models.PointStruct(
-                        id=get_chunk_id(),
-                        vector={
-                            "dense": dense_embedding[index].tolist(),
-                            "sparse": sparse_vectors[index],
-                        },
-                        payload={
-                            "context": doc.context,
-                            "ids": doc.ids,
-                            "page_number": doc.page_number,
-                            "size": doc.size,
-                            "metadatas": doc.metadatas,
-                        },
-                    )
-                )
-            await qdrant_client.upsert(
-                collection_name=request.collection_name, points=points, wait=False
-            )
-            count += len(points)
-            logger.info(f"upserted {len(points)} items (total={count})")
-
-        except Exception as e:
-            logger.error(str(e))
-            raise e
-
-    return {"result": f"{count} items added."}
-
-
-@app.post("/api/v1/documents", operation_id="upsert_documents")
-async def upsert_documents(request: UpsertDocument):
-    """개선된 문서 업서트 with 무결성 보장"""
-    try:
-        await create_collection(
-            CreateCollection(collection_name=request.collection_name)
-        )
-
-        total_document_length = len(request.documents)
-        logger.info(f"Starting upsert of {total_document_length} items")
-
-        # 적응형 배치 업서트 실행
-        result = await adaptive_batch_upsert(
-            collection_name=request.collection_name,
-            documents=request.documents,
-            initial_batch_size=100,  # 기존 크기부터 시작
-            min_batch_size=5,  # 문제 시에만 1개씩
-        )
-
-        # 무결성 검증
-        verification = await verify_upsert_integrity(
-            collection_name=request.collection_name,
-            checkpoint_data=result["checkpoint_data"],
-            sample_rate=0.1,
-        )
-
-        # 실패한 문서 재시도 (옵션)
-        retry_count = 0
-        if result["failed_indices"] and len(result["failed_indices"]) < 50:
-            logger.info(f"Retrying {len(result['failed_indices'])} failed documents")
-            failed_docs = [request.documents[i] for i in result["failed_indices"]]
-            retry_result = await adaptive_batch_upsert(
-                collection_name=request.collection_name,
-                documents=failed_docs,
-                initial_batch_size=30,  # 재시도는 작게 시작
-                min_batch_size=1,
-            )
-            retry_count = retry_result["successful_count"]
-
-        final_success_count = result["successful_count"] + retry_count
-        final_failed_count = result["failed_count"] - retry_count
-
-        response = {
-            "result": f"{final_success_count}/{total_document_length} items added successfully",
-            "details": {
-                "total_requested": total_document_length,
-                "successful": final_success_count,
-                "failed": final_failed_count,
-                "integrity_verified": verification["verified"],
-                "integrity_rate": verification.get("integrity_rate", 0),
-            },
-        }
-
-        if final_failed_count > 0:
-            logger.warning(f"Failed to upsert {final_failed_count} documents")
-            response["warning"] = f"{final_failed_count} documents failed to upsert"
-
-        return response
-    finally:
-        free_memory()
-
-
-def create_sparse_vector(text):
-    embeddings = list(sparse_embedding_model.embed([text]))[0]
-    if hasattr(embeddings, "indices") and hasattr(embeddings, "values"):
-        sparse_vector = models.SparseVector(
-            indices=embeddings.indices.tolist(), values=embeddings.values.tolist()
-        )
-        return sparse_vector
-    else:
-        raise ValueError(
-            "The embeddings object does not have 'indices' and 'values' attributes."
-        )
-
-
-def create_sparse_vectors_batch(texts: List[str]) -> List[models.SparseVector]:
-    """
-    텍스트 리스트를 받아 SparseVector 리스트를 반환하는 배치 처리 함수
-    """
-    # 1. 여기서 texts 리스트 전체를 모델에 넘깁니다. (가장 중요한 부분)
-    # 모델이 내부적으로 병렬 처리나 최적화를 수행합니다.
-    embeddings_generator = sparse_embedding_model.embed(texts)
-
-    results = []
-
-    # 2. 반환된 결과들을 순회하며 변환합니다.
-    for embeddings in embeddings_generator:
-        if hasattr(embeddings, "indices") and hasattr(embeddings, "values"):
-            results.append(
-                models.SparseVector(
-                    indices=embeddings.indices.tolist(),
-                    values=embeddings.values.tolist(),
-                )
-            )
-        else:
-            raise ValueError(
-                "The embeddings object does not have 'indices' and 'values' attributes."
-            )
-
-    return results
-
-
-@app.delete("/api/v1/file", operation_id="remove_file")
-async def remove_file(file_name: str = Body(...), collection_name: str = Body(...)):
-    result = await qdrant_client.delete(
-        collection_name,
-        points_selector=models.Filter(
-            must=[
-                models.FieldCondition(
-                    key="metadatas.file_name", match=models.MatchValue(value=file_name)
-                )
-            ]
-        ),
-        wait=True,
-    )
-    return {"result": result.model_dump()}
-
-
-@app.delete(
-    "/api/v1/documents/{collection_name}/{id}",
-    operation_id="remove_document",
-    description="collection_name : html encoded string",
-)
-async def remove_document(
-    collection_name: str,
-    id: str,
-):
-    decoded_collection_name = html.unescape(collection_name)
-    result = await qdrant_client.delete(
-        decoded_collection_name,
-        points_selector=models.Filter(
-            must=[models.FieldCondition(key="id", match=models.MatchValue(value=id))]
-        ),
-    )
-    return {"result": result.model_dump()}
-
-
-async def get_page(chunks):
-    await create_documents_index()
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-
-    page_collection = mongo_client["rag-data"]["documents"]
-
-    try:
-        p = []
-        # 💡 개선점 1: 중복 p_id를 O(1) 시간 복잡도로 체크하기 위한 set
-        added_p_ids = set()
-        if isinstance(chunks[0], tuple):
-            for chunk, score in chunks:
-                # 'faq' 타입이 아닌 경우에만 DB에서 paragraph를 조회
-                if chunk.get("metadatas", {}).get("paragraph_type") != "faq":
-                    doc_id = chunk.get("metadatas", {}).get("doc_id")
-                    paragraph_id = chunk.get("metadatas", {}).get("paragraph_id")
-                    collection_name = chunk.get("metadatas", {}).get("collection_id")
-                    # id 정보가 없는 chunk는 건너뜀
-                    if not doc_id or not paragraph_id:
-                        p.append(chunk)
-                        continue
-
-                    page = await page_collection.find_one(
-                        {
-                            "collection_id": collection_name,
-                            "metadatas.doc_id": doc_id,
-                            "paragraph_id": paragraph_id,
-                        }
-                    )
-
-                    if page:
-                        p_id = page.get("paragraph_id")
-                        page["id"] = str(page["_id"])
-                        page["rerank_score"] = float(score)
-                        del page["_id"]
-                        page["metadatas"]["bbox"] = chunk["metadatas"]["bbox"]
-                        if p_id and p_id not in added_p_ids:
-                            p.append(page)
-                            added_p_ids.add(p_id)  # set에 p_id 추가
-                    else:
-                        # DB에서 파라그래프를 찾지 못한 경우 원본 chunk를 추가
-                        p.append(chunk)
-                else:
-                    # 'faq' 타입인 경우 원본 chunk를 그대로 추가
-                    p.append(chunk)
-        else:
-            for chunk in chunks:
-                # 'faq' 타입이 아닌 경우에만 DB에서 paragraph를 조회
-                if chunk.get("metadatas", {}).get("paragraph_type") != "faq":
-                    doc_id = chunk.get("metadatas", {}).get("doc_id")
-                    paragraph_id = chunk.get("metadatas", {}).get("paragraph_id")
-                    collection_name = chunk.get("metadatas", {}).get("collection_id")
-                    # id 정보가 없는 chunk는 건너뜀
-                    if not doc_id or not paragraph_id:
-                        p.append(chunk)
-                        continue
-
-                    page = await page_collection.find_one(
-                        {
-                            "collection_id": collection_name,
-                            "metadatas.doc_id": doc_id,
-                            "paragraph_id": paragraph_id,
-                        }
-                    )
-
-                    if page:
-                        p_id = page.get("paragraph_id")
-                        page["id"] = str(page["_id"])
-                        del page["_id"]
-                        page["rerank_score"] = float(chunk["reranked_score"])
-                        if "bbox" in page["metadatas"]:
-                            page["metadatas"]["bbox"] = chunk["metadatas"]["bbox"]
-                        if p_id and p_id not in added_p_ids:
-                            p.append(page)
-                            added_p_ids.add(p_id)  # set에 p_id 추가
-                    else:
-                        # DB에서 파라그래프를 찾지 못한 경우 원본 chunk를 추가
-                        p.append(chunk)
-                else:
-                    # 'faq' 타입인 경우 원본 chunk를 그대로 추가
-                    p.append(chunk)
-        # 💡 개선점 4: 클라이언트 연결은 함수 외부에서 관리하므로 여기서 close() 호출 제거
-        return p
-    finally:
-        mongo_client.close()
-
-
-async def get_paragraphs(chunks):
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-    try:
-        p = []
-        # 💡 개선점 1: 중복 p_id를 O(1) 시간 복잡도로 체크하기 위한 set
-        added_p_ids = set()
-
-        for chunk in chunks:
-            # 'faq' 타입이 아닌 경우에만 DB에서 paragraph를 조회
-            if chunk.get("metadatas", {}).get("paragraph_type") != "faq":
-                doc_id = chunk.get("metadatas", {}).get("doc_id")
-                paragraph_id = chunk.get("metadatas", {}).get("paragraph_id")
-
-                # id 정보가 없는 chunk는 건너뜀
-                if not doc_id or not paragraph_id:
-                    p.append(chunk)
-                    continue
-
-                parag = await get_paragraph(doc_id, paragraph_id, mongo_client)
-
-                if parag:
-                    p_id = parag.get("p_id")
-                    # 💡 개선점 1, 2, 3 통합:
-                    # 1. p_id가 있고,
-                    # 2. added_p_ids set에 아직 추가되지 않았다면
-                    if p_id and p_id not in added_p_ids:
-                        p.append(parag)
-                        added_p_ids.add(p_id)  # set에 p_id 추가
-                else:
-                    # DB에서 파라그래프를 찾지 못한 경우 원본 chunk를 추가
-                    p.append(chunk)
-            else:
-                # 'faq' 타입인 경우 원본 chunk를 그대로 추가
-                p.append(chunk)
-
-        # 💡 개선점 4: 클라이언트 연결은 함수 외부에서 관리하므로 여기서 close() 호출 제거
-        return p
-    finally:
-        mongo_client.close()
-
-
-async def get_paragraph(doc_id, paragraph_id, mongo_client: AsyncIOMotorClient):
-    db = mongo_client["paragraph"][doc_id]
-    res = await db.find_one({"p_id": paragraph_id})
-    if res and "_id" in res:
-        del res["_id"]
-
-    if res and "sentenses" in res:
-        joined_context = []
-        for p in res["sentenses"]:
-            context = p["context"]
-            if context.startswith(p["metadatas"]["prefix"]) == False:
-                context = f"[{p["metadatas"]["prefix"]}] {context}"
-
-            joined_context.append(context)
-
-        paragraph = {
-            "p_id": res["p_id"],
-            "context": "\n".join(joined_context),
-            "metadatas": {
-                "doc_id": res["metadatas"]["doc_id"],
-                "file_name": res["metadatas"]["file_name"],
-            },
-        }
-    else:
-        paragraph = res
-    return paragraph
-
-
-async def get_search_result(
-    collection_name, query, metadata_filter_key, match_values, top_k, room_id=None
-) -> models.QueryResponse:
-    dense_query = embedding_model.encode(query, normalize_embeddings=True)
-    sparse_query = list(sparse_embedding_model.embed([query]))[0]
-    query_filter = None
-    prefetch = [
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_query.indices.tolist(),
-                values=sparse_query.values.tolist(),
-            ),
-            using="sparse",
-            limit=top_k,
-        ),
-        models.Prefetch(query=dense_query, using="dense", limit=top_k),
-    ]
-
-    conditions = []
-    if room_id:
-        conditions.append(
-            models.FieldCondition(
-                key="metadatas.room_id", match=models.MatchAny(any=[room_id])
-            )
-        )
-
-    if metadata_filter_key and len(match_values) > 0:
-        filter_key = f"metadatas.{metadata_filter_key}"
-        conditions.append(
-            models.FieldCondition(
-                key=filter_key, match=models.MatchAny(any=match_values)
-            )
-        )
-
-    query_filter = models.Filter(must=conditions)
-
-    fusion_results = await qdrant_client.query_points(
-        collection_name=collection_name,
-        prefetch=prefetch,
-        query_filter=query_filter,
-        search_params=models.SearchParams(hnsw_ef=128),
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=50,
-    )
-
-    del (
-        dense_query,
-        sparse_query,
-    )
-    return fusion_results
-
-
-class SearchDocument(BaseModel):
-    collection_name: str
-    query: str
-    use_paragraph: bool = False
-    query_normalize: bool = False
-    metadata_filter_key: str | None
-    match_values: List[str] | None
-    top_k: int = 100
-    room_id: Optional[str] = None
-
-
-@app.post("/api/v1/document/paragraph", operation_id="search_and_paragraph")
-async def search_and_paragraph(request: SearchDocument):
-    query = request.query
-
-    dense_query = embedding_model.encode(query, normalize_embeddings=True)
-    sparse_query = list(sparse_embedding_model.embed([query]))[0]
-    query_filter = None
-    prefetch = [
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_query.indices.tolist(),
-                values=sparse_query.values.tolist(),
-            ),
-            using="sparse",
-            limit=request.top_k,
-            score_threshold=0.6,
-        ),
-        models.Prefetch(
-            query=dense_query, using="dense", limit=request.top_k, score_threshold=0.6
-        ),
-    ]
-    if request.metadata_filter_key and len(request.match_values) > 0:
-        filter_key = f"metadatas.{request.metadata_filter_key}"
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key=filter_key, match=models.MatchValue(value=request.match_values)
-                )
-            ]
-        )
-    fusion_results = await qdrant_client.query_points(
-        collection_name=request.collection_name,
-        prefetch=prefetch,
-        query_filter=query_filter,
-        search_params=models.SearchParams(hnsw_ef=128),
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=request.top_k,
-    )
-    reranked = grid_rerank(query, fusion_results.points, 5)
-    if request.use_paragraph:
-        p = await get_paragraphs(reranked)  # 💡 await 추가
-        return JSONResponse(content=p)
-    else:
-        return JSONResponse(content=reranked)
-
-
-@app.post(
-    "/api/v1/document/search_rerank",
-    operation_id="search_similar_documents_with_reranker",
-)
-async def search_similar_documents_with_reranker(request: SearchDocument):
-    start_time = time.time()
-    try:
-        query = request.query
-
-        dense_query = embedding_model.encode(query, normalize_embeddings=True)
-        sparse_query = list(sparse_embedding_model.embed([query]))[0]
-        query_filter = None
-        prefetch = [
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=sparse_query.indices.tolist(),
-                    values=sparse_query.values.tolist(),
-                ),
-                using="sparse",
-                limit=request.top_k,
-            ),
-            models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-        ]
-        if request.metadata_filter_key and len(request.match_values) > 0:
-            filter_key = f"metadatas.{request.metadata_filter_key}"
-
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key=filter_key, match=models.MatchAny(any=request.match_values)
-                    )
-                ]
-            )
-
-        fusion_results = await qdrant_client.query_points(
-            collection_name=request.collection_name,
-            prefetch=prefetch,
-            query_filter=query_filter,
-            search_params=models.SearchParams(hnsw_ef=128),
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=request.top_k,
-            score_threshold=0.1,
-        )
-        reranked = grid_rerank(query, fusion_results.points, 5)
-        if request.use_paragraph:
-            p = await get_paragraphs(reranked)
-            logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
-            return JSONResponse(content=p)
-        else:
-            return JSONResponse(content=reranked)
-    except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
-    finally:
-        end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"Search time: {execution_time:.5f} sec")
-
-
-@app.post(
-    "/api/v2/document/search_rerank",
-    operation_id="search_similar_documents_with_reranker_v2",
-)
-async def search_similar_documents_with_reranker_v2(request: SearchDocument):
-    start_time = time.time()
-
-    query = request.query
-
-    fusion_results = await get_search_result(
-        request.collection_name,
-        query,
-        request.metadata_filter_key,
-        request.match_values,
-        request.top_k,
-        request.room_id,
-    )
-
-    try:
-        reranked = grid_rerank(query, fusion_results.points, 5)
-        if request.use_paragraph:
-            p = await get_page(reranked)
-            return JSONResponse(content=p)
-        else:
-            return JSONResponse(content=reranked)
-    except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
-    finally:
-        end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"Search time: {execution_time:.5f} sec")
-        del fusion_results
-        free_memory()
-
-
-@app.post(
-    "/api/v2/document/search_paragraph",
-    operation_id="search_paragraph",
-)
-async def search_paragraph(request: SearchDocument):
-    start_time = time.time()
-
-    query = request.query
-
-    fusion_results = await get_search_result(
-        request.collection_name,
-        query,
-        request.metadata_filter_key,
-        request.match_values,
-        request.top_k,
-    )
-
-    try:
-        reranked = grid_rerank(query, fusion_results.points, 10)
-        pages = await get_page(reranked)
-        result = [
-            {"paragraph_id": p["paragraph_id"], "score": p["rerank_score"]}
-            for p in pages
-        ]
-        return JSONResponse(content=result)
-    except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
-    finally:
-        end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"Search time: {execution_time:.5f} sec")
-        del fusion_results
-        free_memory()
-
-
-@app.post(
-    "/api/v1/document/search_test",
-    operation_id="search_similar_documents_test_with_reranker",
-)
-async def search_similar_documents_test_with_reranker(request: SearchDocument):
-    query = request.query
-
-    fusion_results = await get_search_result(
-        request.collection_name,
-        query,
-        request.metadata_filter_key,
-        request.match_values,
-        request.top_k,
-    )
-    response = {
-        "fusion_result": [
-            {
-                "context": result.payload["context"],
-                "ids": result.payload["ids"],
-                "metadatas": result.payload["metadatas"],
-            }
-            for result in fusion_results.points
-        ]
-    }
-    reranked = grid_rerank(query, fusion_results.points, 5)
-    response["reranked"] = reranked
-    response["query"] = query
-    p = await get_paragraphs(reranked)
-    logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
-    response["paragraph"] = p
-    return JSONResponse(content=response)
-
-
-@app.post("/api/v1/document/search", operation_id="search_document")
-async def search_similar_documents(request: SearchDocument):
-    query = request.query
-
-    dense_query = embedding_model.encode(query, normalize_embeddings=True)
-    sparse_query = list(sparse_embedding_model.embed([query]))[0]
-    query_filter = None
-    prefetch = [
-        models.Prefetch(
-            query=models.SparseVector(
-                indices=sparse_query.indices.tolist(),
-                values=sparse_query.values.tolist(),
-            ),
-            using="sparse",
-            limit=request.top_k,
-        ),
-        models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-    ]
-    if request.metadata_filter_key and len(request.match_values) > 0:
-        filter_key = f"metadatas.{request.metadata_filter_key}"
-        query_filter = models.Filter(
-            must=[
-                models.FieldCondition(
-                    key=filter_key, match=models.MatchValue(value=request.match_values)
-                )
-            ]
-        )
-    fusion_results = await qdrant_client.query_points(
-        collection_name=request.collection_name,
-        prefetch=prefetch,
-        query_filter=query_filter,
-        search_params=models.SearchParams(hnsw_ef=128),
-        query=models.FusionQuery(fusion=models.Fusion.RRF),
-        limit=request.top_k,
-        score_threshold=0.11,
-    )
-    return fusion_results.points
-
-
-async def pages_to_mongo(paragraph_list):
-    await create_documents_index()
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-    doc_collection = mongo_client["rag-data"]["documents"]
-    await doc_collection.insert_many(paragraph_list)
-
-
-async def paragraph_to_mongo(document_id, paragraph_list):
-    """MongoDB에 문단 저장 with retry"""
-    if not paragraph_list:
-        return
-
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-    try:
-        doc_collection = mongo_client["paragraph"][document_id]
-
-        # 배치 처리로 메모리 효율성 향상
-        batch_size = 100
-        for i in range(0, len(paragraph_list), batch_size):
-            batch = paragraph_list[i : i + batch_size]
-            retry_count = 3
-            while retry_count > 0:
-                try:
-                    await doc_collection.insert_many(batch, ordered=False)
-                    break
-                except Exception as e:
-                    retry_count -= 1
-                    if retry_count == 0:
-                        logger.error(
-                            f"Failed to insert paragraph batch {i}-{i+batch_size}: {e}"
-                        )
-                    else:
-                        await asyncio.sleep(2 ** (3 - retry_count))
-    finally:
-        mongo_client.close()
-
-
-async def chunk_to_mongo(collection_name, chunks):
-    """MongoDB에 청크 저장 with retry"""
-    if not chunks:
-        return
-
-    mongo_client = AsyncIOMotorClient(
-        f"mongodb://{settings.db.host}:{settings.db.port}"
-    )
-    try:
-        doc_collection = mongo_client["chunks"][collection_name]
-
-        # 배치 처리로 메모리 효율성 향상
-        batch_size = 100
-        for i in range(0, len(chunks), batch_size):
-            batch = chunks[i : i + batch_size]
-            retry_count = 3
-            while retry_count > 0:
-                try:
-                    await doc_collection.insert_many(batch, ordered=False)
-                    break
-                except Exception as e:
-                    retry_count -= 1
-                    if retry_count == 0:
-                        logger.error(
-                            f"Failed to insert batch {i}-{i+batch_size} to MongoDB: {e}"
-                        )
-                    else:
-                        await asyncio.sleep(2 ** (3 - retry_count))
-    finally:
-        mongo_client.close()
-
-
-# @app.post("/api/v2/document/search_page")
-# async def search_similar_documents_with_reranker_v2(
-#     request: SearchDocument
-# ):
-#     start_time = time.time()
-#     try:
-#         query = request.query
-#         if request.query_normalize:
-#             query = await query_normalizer(request.query)
-#         dense_query = embedding_model.encode(query, normalize_embeddings=True)
-#         sparse_query = list(sparse_embedding_model.embed([query]))[0]
-#         query_filter = None
-#         prefetch = [
-#             models.Prefetch(
-#                 query=models.SparseVector(
-#                     indices=sparse_query.indices.tolist(),
-#                     values=sparse_query.values.tolist(),
-#                 ),
-#                 using="sparse",
-#                 limit=request.top_k,
-#             ),
-#             models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-#         ]
-#         if request.metadata_filter_key and len(request.match_values) > 0:
-#             filter_key = f"metadatas.{request.metadata_filter_key}"
-
-#             query_filter = models.Filter(
-#                 must=[
-#                     models.FieldCondition(
-#                         key=filter_key, match=models.MatchAny(any=request.match_values)
-#                     )
-#                 ]
-#             )
-
-#         fusion_results = await qdrant_client.query_points(
-#             collection_name=request.collection_name,
-#             prefetch=prefetch,
-#             query_filter=query_filter,
-#             search_params=models.SearchParams(hnsw_ef=128),
-#             query=models.FusionQuery(fusion=models.Fusion.RRF),
-#             limit=request.top_k,
-#             score_threshold=0.1,
-#         )
-
-#         reranked = qwen3_rerank(query, fusion_results.points)
-#         p = await get_page(reranked)
-#         logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
-#         return JSONResponse(content=p)
-
-#     except Exception as e:
-#         return JSONResponse(status_code=500, content=str(e))
-#     finally:
-#         end_time = time.time()
-#         execution_time = end_time - start_time
-#         logger.info(f"Search time: {execution_time:.5f} sec")
-
-
-@app.post(
-    "/api/v1/document/search_page",
-    operation_id="search_page",
-)
-async def search_page(request: SearchDocument):
-    start_time = time.time()
-    try:
-        query = request.query
-
-        dense_query = embedding_model.encode(query, normalize_embeddings=True)
-        sparse_query = list(sparse_embedding_model.embed([query]))[0]
-        query_filter = None
-        prefetch = [
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=sparse_query.indices.tolist(),
-                    values=sparse_query.values.tolist(),
-                ),
-                using="sparse",
-                limit=request.top_k,
-            ),
-            models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-        ]
-        if request.metadata_filter_key and len(request.match_values) > 0:
-            filter_key = f"metadatas.{request.metadata_filter_key}"
-
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key=filter_key, match=models.MatchAny(any=request.match_values)
-                    )
-                ]
-            )
-
-        fusion_results = await qdrant_client.query_points(
-            collection_name=request.collection_name,
-            prefetch=prefetch,
-            query_filter=query_filter,
-            search_params=models.SearchParams(hnsw_ef=128),
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=request.top_k,
-            score_threshold=0.1,
-        )
-        reranked = grid_rerank(query, fusion_results.points, 5)
-        p = await get_page(reranked)
-        logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
-        return JSONResponse(content=p)
-
-    except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
-    finally:
-        end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"Search time: {execution_time:.5f} sec")
-
-
-@app.post(
-    "/api/v1/document/query",
-    operation_id="search_similar_documents_with_reranker",
-)
-async def search_similar_documents_with_reranker_query(request: SearchDocument):
-    start_time = time.time()
-    try:
-        query = request.query
-
-        dense_query = await encoding_query(query)
-        sparse_query = list(sparse_embedding_model.embed([query]))[0]
-        query_filter = None
-        prefetch = [
-            models.Prefetch(
-                query=models.SparseVector(
-                    indices=sparse_query.indices.tolist(),
-                    values=sparse_query.values.tolist(),
-                ),
-                using="sparse",
-                limit=request.top_k,
-            ),
-            models.Prefetch(query=dense_query, using="dense", limit=request.top_k),
-        ]
-        if request.metadata_filter_key and len(request.match_values) > 0:
-            filter_key = f"metadatas.{request.metadata_filter_key}"
-
-            query_filter = models.Filter(
-                must=[
-                    models.FieldCondition(
-                        key=filter_key, match=models.MatchAny(any=request.match_values)
-                    )
-                ]
-            )
-
-        fusion_results = await qdrant_client.query_points(
-            collection_name=request.collection_name,
-            prefetch=prefetch,
-            query_filter=query_filter,
-            search_params=models.SearchParams(hnsw_ef=128),
-            query=models.FusionQuery(fusion=models.Fusion.RRF),
-            limit=request.top_k,
-            score_threshold=0.1,
-        )
-        reranked = grid_rerank(query, fusion_results.points, 5)
-        if request.use_paragraph:
-            p = await get_paragraphs(reranked)
-            logger.info(f"{query} :\n{json.dumps(p, ensure_ascii=False, indent=True)}")
-            return JSONResponse(content=p)
-        else:
-            return JSONResponse(content=reranked)
-    except Exception as e:
-        return JSONResponse(status_code=500, content=str(e))
-    finally:
-        end_time = time.time()
-        execution_time = end_time - start_time
-        logger.info(f"Search time: {execution_time:.5f} sec")
-
-
-# @torch.no_grad()
-# def compute_scores(query, points: List[str], batch_size=16) -> np.ndarray:
-#     scores = []
-
-#     # 배치 처리
-#     for i in range(0, len(points), batch_size):
-#         batch_docs = points[i : i + batch_size]
-
-#         # 쿼리-문서 쌍 생성
-#         pairs = [[query, doc] for doc in batch_docs]
-
-#         # 토크나이징
-#         inputs = tokenizer(
-#             pairs,
-#             padding=True,
-#             truncation=True,
-#             max_length=8196,
-#             return_tensors="pt",
-#         ).to(device)
-
-#         # 점수 계산
-#         outputs = model(**inputs)
-
-#         # logits를 점수로 변환 (시그모이드 또는 소프트맥스 적용 가능)
-#         if outputs.logits.shape[-1] == 1:
-#             # 회귀 모델인 경우
-#             batch_scores = outputs.logits.squeeze(-1).cpu().numpy()
-#         else:
-#             # 분류 모델인 경우 (positive 클래스의 확률 사용)
-#             batch_scores = torch.softmax(outputs.logits, dim=-1)[:, 1].cpu().numpy()
-
-#         scores.extend(batch_scores)
-#     return np.array(scores)
-
-
-# def qwen3_rerank(
-#     query: str,
-#     documents: List[models.ScoredPoint],
-#     top_k: Optional[int] = 5,
-#     return_scores: bool = False,
-# ) -> List[Tuple[Document, float]]:
-#     """
-#     문서들을 리랭킹
-
-#     Args:
-#         query: 검색 쿼리
-#         documents: Document 객체 리스트
-#         top_k: 반환할 상위 문서 개수 (None이면 전체 반환)
-#         return_scores: 점수를 함께 반환할지 여부
-
-#     Returns:
-#         (Document, score) 튜플 리스트 (점수 내림차순 정렬)
-#     """
-#     if not documents:
-#         return []
-
-#     # 문서 텍스트 추출
-#     doc_texts = [doc.payload["context"] for doc in documents]
-
-#     # 점수 계산
-#     logger.info(f"Computing scores for {len(documents)} documents...")
-#     scores = compute_scores(query, doc_texts)
-
-#     # 점수와 문서를 쌍으로 묶기
-#     doc_score_pairs = list(zip(documents, scores))
-
-#     # 점수 기준 내림차순 정렬
-#     doc_score_pairs.sort(key=lambda x: x[1], reverse=True)
-
-#     # top_k 적용
-#     if top_k is not None:
-#         doc_score_pairs = doc_score_pairs[:top_k]
-
-#     if return_scores:
-#         return doc_score_pairs
-#     else:
-#         return [(doc.payload, score) for doc, score in doc_score_pairs]
-
-
-def grid_rerank(query, fusion, rerank_top_k=5):
-    url = f"{settings.a2o.reranker}/v2/predict"
-    chunks = [
-        {
-            "context": result.payload["context"],
-            "ids": result.payload["ids"],
-            "metadatas": result.payload["metadatas"],
-        }
-        for result in fusion
-    ]
-    packet = {
-        "reqid": "1818",
-        "input": {
-            "items": [{"query": query, "k": rerank_top_k, "retrieved_chunks": chunks}]
-        },
-    }
-    payload = json.dumps(packet, ensure_ascii=False)
-    headers = {"Content-Type": "application/json"}
-    try:
-        response = requests.request(
-            "POST", url, headers=headers, data=payload, timeout=10000
-        )
-        res_json = json.loads(response.text)
-        col = res_json["output"]["items"][0]["top_k_chunks"]
-        return col
-    except:
-        return []
+# ════════════════════════════════════════════════════════════════════════════════
+# RabbitMQ EmbeddingConsumer
+# ════════════════════════════════════════════════════════════════════════════════
 
 
 class EmbeddingConsumer(RagEmbeddingWorker):
+    """
+    RabbitMQ 'rag.embedding.request' 큐를 구독하는 임베딩 소비자.
+
+    수신 메시지 형식 (Redis 키 기반)
+    ----------------------------------
+    {
+        "job_id":          "unique-job-id",
+        "file_id":         "file-storage-id",
+        "doc_id":          "document-id",
+        "collection_id":   "default",
+        "redis_chunk_key": "rag.document.{doc_id}.chunk",
+        "redis_para_key":  "rag.document.{doc_id}.para",
+        "redis_img_key":   "rag.document.{doc_id}.img",   (선택)
+        "redis_tbl_key":   "rag.document.{doc_id}.tbl"    (선택)
+    }
+
+    처리 순서
+    ---------
+    1. Redis에서 청크/단락 데이터 로드
+    2. upsert_documents()로 청크 임베딩 → Qdrant 저장
+    3. chunk_to_mongo()로 청크 원문 → MongoDB 저장
+    4. paragraph_to_mongo()로 단락 원문 → MongoDB 저장
+    5. 완료/실패 메시지를 MQ 프로듀서로 발행
+    """
+
     async def handle_message(self, data: Dict[str, Any], context: MessageContext):
         mq = RabbitMQClient.get_instance()
         redis_client = Redis()
 
+        job_id = data.get("job_id")
+        doc_id = data.get("doc_id")
+        file_id = data.get("file_id")
+        collection_id = data.get("collection_id")
+        redis_chunk_key = data.get("redis_chunk_key")
+        redis_para_key = data.get("redis_para_key")
+        redis_img_key = data.get("redis_img_key")
+        redis_tbl_key = data.get("redis_tbl_key")
+
         try:
-            # {
-            #     "job_id": "unique-job-id",
-            #     "file_id": "file-storage-id",
-            #     "doc_id": "document-id",
-            #     "collection_id": "default",
-            #     "redis_chunk_key": "rag.document.{doc_id}.chunk",
-            #     "redis_para_key": "rag.document.{doc_id}.para",
-            #     "redis_img_key": "rag.document.{doc_id}.img",
-            #     "redis_tbl_key": "rag.document.{doc_id}.tbl",
-            # }
-
-            job_id = data.get("job_id")
-
-            logger.info(f"[{job_id}] Embedding Reqeust Incomming...")
+            logger.info(f"[{job_id}] 임베딩 요청 수신")
             await mq.get_producer(RagProducer.EMBEDDING_STARTED).publish(
                 {"job_id": job_id, "message": "임베딩 시작"}
             )
-            logger.info(f"[{job_id}] Start embedding...")
 
-            doc_id = data.get("doc_id")
-            file_id = data.get("file_id")
-            collection_id = data.get("collection_id")
-            redis_para_key = data.get("redis_para_key")
-            redis_chunk_key = data.get("redis_chunk_key")
-            redis_img_key = data.get("redis_img_key", None)
-            redis_tbl_key = data.get("redis_tbl_key", None)
+            # Redis에서 청크/단락 데이터 로드
+            chunks_raw = await redis_client.get(redis_chunk_key)
+            paragraphs_raw = await redis_client.get(redis_para_key)
 
-            logger.info(json.dumps(data, ensure_ascii=False, indent=True))
+            # Redis 값은 {"data": [...]} 형식의 dict
+            c_data = chunks_raw.get("data", []) if isinstance(chunks_raw, dict) else []
+            p_data = paragraphs_raw.get("data", []) if isinstance(paragraphs_raw, dict) else []
 
-            chunks = await redis_client.get(redis_chunk_key)
-            paragraphs = await redis_client.get(redis_para_key)
+            logger.info(f"[{job_id}] 청크 {len(c_data)}건 / 단락 {len(p_data)}건 로드")
 
-            # 디버깅: Redis에서 받은 데이터 타입 확인
-            logger.debug(
-                f"chunks type: {type(chunks)}, value: {chunks if chunks is None else 'Has data'}"
+            # 청크 임베딩 → Qdrant upsert
+            upsert_request = UpsertDocument(
+                collection_name=collection_id, documents=c_data
             )
-            logger.debug(
-                f"paragraphs type: {type(paragraphs)}, value: {paragraphs if paragraphs is None else 'Has data'}"
-            )
+            result = await upsert_documents(upsert_request)
+            logger.info(f"[{job_id}] Qdrant upsert 완료: {result.get('result')}")
 
-            # 안전한 데이터 추출 (dict 체크 + get 메서드 사용)
-            c_data = []
-            if chunks and isinstance(chunks, dict):
-                c_data = chunks.get("data", [])
-            c_data_len = len(c_data)
-            logger.info(f"chunks : {c_data_len} items")
-
-            p_data = []
-            if paragraphs and isinstance(paragraphs, dict):
-                p_data = paragraphs.get("data", [])
-            p_data_len = len(p_data)
-            logger.info(f"paragraphs : {p_data_len} items")
-
-            request = UpsertDocument(collection_name=collection_id, documents=c_data)
-            result = await upsert_documents(request)
-            logger.info(json.dumps(result, ensure_ascii=False, indent=True))
+            # 원문 MongoDB 저장
             await chunk_to_mongo(collection_id, c_data)
-            logger.info(f"{c_data_len} chunks added.(mongo)")
-            await pages_to_mongo(p_data)
-            logger.info(f"{p_data_len} paragraphs added.(mongo)")
+            logger.info(f"[{job_id}] 청크 MongoDB 저장 완료: {len(c_data)}건")
 
+            await paragraph_to_mongo(p_data)
+            logger.info(f"[{job_id}] 단락 MongoDB 저장 완료: {len(p_data)}건")
+
+            # 완료 이벤트 발행
             await mq.get_producer(RagProducer.EMBEDDING_COMPLETED).publish(
                 {
                     "job_id": job_id,
                     "file_id": file_id,
-                    "embedded_chunks": c_data_len,
-                    "embedded_paragraphs": p_data_len,
-                    "redis_para_key": redis_para_key,
+                    "embedded_chunks": len(c_data),
+                    "embedded_paragraphs": len(p_data),
                     "redis_chunk_key": redis_chunk_key,
+                    "redis_para_key": redis_para_key,
                     "redis_img_key": redis_img_key,
                     "redis_tbl_key": redis_tbl_key,
                     "message": "임베딩 완료",
                 }
             )
-            logger.info(f"[{job_id}] Embedding completed successfully")
+            logger.info(f"[{job_id}] 임베딩 완료")
 
         except Exception as e:
-            failure_message = {
+            # 실패 이벤트 발행 후 예외를 재raise하지 않음
+            # (MQ 소비자가 메시지를 ack하고 실패 큐로 라우팅)
+            failure = {
                 "job_id": job_id,
+                "doc_id": doc_id,
+                "collection_id": collection_id,
                 "error": str(e),
                 "error_type": type(e).__name__,
-                "handler": handler_name,
+                "handler": HANDLER_NAME,
             }
-
-            message = json.dumps(failure_message, ensure_ascii=False, indent=True)
             await mq.get_producer(RagProducer.EMBEDDING_FAILED).publish(
                 {
-                    "job_id": job_id,
-                    "doc_id": doc_id,
-                    "collection_id": collection_id,
-                    "redis_para_key": redis_para_key,
+                    **failure,
                     "redis_chunk_key": redis_chunk_key,
+                    "redis_para_key": redis_para_key,
                     "redis_img_key": redis_img_key,
                     "redis_tbl_key": redis_tbl_key,
-                    "message": message,
+                    "message": json.dumps(failure, ensure_ascii=False),
                 }
             )
-            logger.error(f"[{job_id}] {message}")
+            logger.error(f"[{job_id}] 임베딩 실패: {e}")
 
 
-rabbitmq_connection_config = ConnectionConfig(**settings.mq.model_dump())
+# ════════════════════════════════════════════════════════════════════════════════
+# Redis / RabbitMQ 초기화 헬퍼
+# ════════════════════════════════════════════════════════════════════════════════
+
+_rabbitmq_config = ConnectionConfig(**settings.mq.model_dump())
 
 
-async def setup_redis():
+async def _setup_redis() -> None:
+    """Redis 연결을 초기화한다 (싱글톤 Redis 인스턴스 재사용)."""
     redis_client = Redis()
     await redis_client.init(**settings.redis.model_dump())
+    logger.info("Redis 연결 완료")
 
 
-async def clear_redis():
+async def _clear_redis() -> None:
+    """Redis 연결을 닫는다."""
     redis_client = Redis()
     await redis_client.close()
+    logger.info("Redis 연결 해제")
 
 
-async def setup_mq():
-    rabbitmq_client = RabbitMQClient.get_instance()
-    await rabbitmq_client.init(rabbitmq_connection_config)
+async def _setup_mq() -> None:
+    """
+    RabbitMQ에 연결하고 프로듀서/컨슈머를 등록한다.
 
-    from gridone_rabbitmq.rag import (
-        publish_embedding_started,
+    등록 프로듀서
+    -------------
+    - EMBEDDING_STARTED   : 임베딩 시작 알림
+    - EMBEDDING_COMPLETED : 임베딩 완료 알림
+    - EMBEDDING_FAILED    : 임베딩 실패 알림
+
+    등록 컨슈머
+    -----------
+    - EmbeddingConsumer : rag.embedding.request 큐 구독
+      (start_consumers()는 주석 처리 — 필요 시 활성화)
+    """
+    from wrapper.rabbitmq_wrapper_for_rag import (
         publish_embedding_completed,
         publish_embedding_failed,
+        publish_embedding_started,
     )
 
-    await rabbitmq_client.register_handlers(
-        [
-            publish_embedding_started,
-            publish_embedding_completed,
-            publish_embedding_failed,
-        ]
+    client = RabbitMQClient.get_instance()
+    await client.init(_rabbitmq_config)
+    await client.register_handlers(
+        [publish_embedding_started, publish_embedding_completed, publish_embedding_failed]
     )
-    rabbitmq_client.add_consumer(EmbeddingConsumer(rabbitmq_client))
-    # await rabbitmq_client.start_consumers()
-    return rabbitmq_client
+    client.add_consumer(EmbeddingConsumer(client))
+    # await client.start_consumers()  # 활성화 시 MQ 소비 시작
+    logger.info("RabbitMQ 연결 및 핸들러 등록 완료")
 
 
-async def clear_mq():
-    rabbitmq_client = RabbitMQClient.get_instance()
-    await rabbitmq_client.close()
+async def _clear_mq() -> None:
+    """RabbitMQ 연결을 닫는다."""
+    client = RabbitMQClient.get_instance()
+    await client.close()
+    logger.info("RabbitMQ 연결 해제")

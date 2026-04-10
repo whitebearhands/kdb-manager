@@ -6,7 +6,7 @@ from typing import Literal, Optional
 load_dotenv()
 
 
-class aiio(BaseModel):
+class microservice(BaseModel):
     reranker: str = Field(default="")
 
 
@@ -23,20 +23,6 @@ class EmbedingModel(BaseModel):
     model_device: str = Field(default="")
     rerank_name: str = Field(default="")
     rerank_path: str = Field(default="")
-
-
-class LLMModel(BaseModel):
-    base_url: str = Field(default="")
-    api_key: str = Field(default="")
-    model: str = Field(default="")
-    temparature: float = Field(default=0)
-    top_p: float = Field(default=0)
-    connect_timeout: float = Field(default=0)
-    read_timeout: float = Field(default=0)
-    available_tokens: int = Field(default=0)
-    threshold: int = Field(default=0)
-    frequency_penalty: float = Field(default=0)
-    k: int = Field(default=0)
 
 
 class AppSettings(BaseModel):
@@ -104,10 +90,6 @@ class LogSettings(BaseModel):
         ge=1,
         description="로그 파일 백업 개수",
     )
-
-
-class Encoder(BaseModel):
-    url: str = Field(default="")
 
 
 class RedisSettings(BaseModel):
@@ -234,10 +216,7 @@ class Settings(BaseSettings):
         default_factory=MQSettings,
         description="AMQP 설정",
     )
-    llm: LLMModel = Field(
-        default_factory=LLMModel,
-        description="LLM 설정",
-    )
+
     model: EmbedingModel = Field(
         default_factory=EmbedingModel,
         description="모델 설정",
@@ -246,11 +225,10 @@ class Settings(BaseSettings):
         default_factory=Qdrant,
         description="qdrant 설정",
     )
-    a2o: aiio = Field(
-        default_factory=aiio,
-        description="qdrant 설정",
+    ms: microservice = Field(
+        default_factory=microservice,
+        description="마이크로서비스 설정",
     )
-    encoder: Encoder = Field(default_factory=Encoder)
 
     class Config:
         env_file = ".env"
